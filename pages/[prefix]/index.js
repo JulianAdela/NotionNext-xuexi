@@ -1,17 +1,23 @@
 import BLOG from '@/blog.config'
 import useNotification from '@/components/Notification'
-import OpenWrite from '@/components/OpenWrite'
+import TechGrow from '@/components/TechGrow'
 import { siteConfig } from '@/lib/config'
-import { getGlobalData, getPost } from '@/lib/db/getSiteData'
+import { fetchGlobalAllData, resolvePostProps } from '@/lib/db/SiteDataApi'
 import { useGlobal } from '@/lib/global'
-import { getPageTableOfContents } from '@/lib/notion/getPageTableOfContents'
-import { getPasswordQuery } from '@/lib/password'
-import { checkSlugHasNoSlash, processPostData } from '@/lib/utils/post'
+import { getPageTableOfContents } from '@/lib/db/notion/getPageTableOfContents'
+import {
+  getPasswordQuery,
+  getPasswordStoragePath,
+  sha256Digest
+} from '@/lib/utils/password'
+import { checkSlugHasNoSlash } from '@/lib/utils/post'
 import { DynamicLayout } from '@/themes/theme'
 import md5 from 'js-md5'
 import { useRouter } from 'next/router'
-import { idToUuid } from 'notion-utils'
+import PropTypes from 'prop-types'
 import { useEffect, useState } from 'react'
+import { isExport } from '@/lib/utils/buildMode'
+import { getPriorityPages, prefetchAllBlockMaps } from '@/lib/build/prefetch'
 
 /**
  * 根据notion的slug访问页面
@@ -36,11 +42,15 @@ const Slug = props => {
     if (!post) {
       return false
     }
-    const encrypt = md5(post?.slug + passInput)
-    if (passInput && encrypt === post?.password) {
+    const legacy = md5(String(post?.slug ?? '') + passInput)
+    const nextHash = sha256Digest(passInput)
+    if (nextHash === post?.password || legacy === post?.password) {
       setLock(false)
-      // 输入密码存入localStorage，下次自动提交
-      localStorage.setItem('password_' + router.asPath, passInput)
+      // 输入密码存入 localStorage；键仅含 pathname，避免 query/hash 导致读写不一致（PR #3389）
+      localStorage.setItem(
+        'password_' + getPasswordStoragePath(router.asPath),
+        passInput
+      )
       showNotification(locale.COMMON.ARTICLE_UNLOCK_TIPS) // 设置解锁成功提示显示
       return true
     }
@@ -90,71 +100,67 @@ const Slug = props => {
       {/* 解锁密码提示框 */}
       {post?.password && post?.password !== '' && !lock && <Notification />}
       {/* 导流工具 */}
-      <OpenWrite />
+      <TechGrow lock={lock} />
     </>
   )
 }
 
+Slug.propTypes = {
+  post: PropTypes.shape({
+    id: PropTypes.string,
+    slug: PropTypes.string,
+    password: PropTypes.string,
+    content: PropTypes.array,
+    toc: PropTypes.array,
+    blockMap: PropTypes.shape({
+      block: PropTypes.object
+    })
+  }),
+  NOTION_CONFIG: PropTypes.object
+}
+
 export async function getStaticPaths() {
-  if (!BLOG.isProd) {
+  const from = 'slug-paths'
+  const { allPages } = await fetchGlobalAllData({ from })
+
+  // Export 模式：全量预生成
+  if (isExport()) {
+    await prefetchAllBlockMaps(allPages)
     return {
-      paths: [],
-      fallback: true
+      paths: allPages
+        ?.filter(row => checkSlugHasNoSlash(row))
+        .map(row => ({ params: { prefix: row.slug } })),
+      fallback: false
     }
   }
 
-  const from = 'slug-paths'
-  const { allPages } = await getGlobalData({ from })
-  const paths = allPages
-    ?.filter(row => checkSlugHasNoSlash(row))
-    .map(row => ({ params: { prefix: row.slug } }))
+  // ISR 模式：预生成最新10篇，其余按需渲染
+  const tops = getPriorityPages(allPages)
+
   return {
-    paths: paths,
-    fallback: true
+    paths: tops
+      .filter(row => checkSlugHasNoSlash(row))
+      .map(row => ({ params: { prefix: row.slug } })),
+    fallback: 'blocking'
   }
 }
 
 export async function getStaticProps({ params: { prefix }, locale }) {
-  let fullSlug = prefix
-  const from = `slug-props-${fullSlug}`
-  const props = await getGlobalData({ from, locale })
-  if (siteConfig('PSEUDO_STATIC', false, props.NOTION_CONFIG)) {
-    if (!fullSlug.endsWith('.html')) {
-      fullSlug += '.html'
-    }
-  }
-
-  // 在列表内查找文章
-  props.post = props?.allPages?.find(p => {
-    return (
-      p.type.indexOf('Menu') < 0 &&
-      (p.slug === prefix || p.id === idToUuid(prefix))
-    )
+  const props = await resolvePostProps({
+    prefix,
+    locale,
   })
 
-  // 处理非列表内文章的内信息
-  if (!props?.post) {
-    const pageId = prefix
-    if (pageId.length >= 32) {
-      const post = await getPost(pageId)
-      props.post = post
-    }
-  }
-  if (!props?.post) {
-    // 无法获取文章
-    props.post = null
-  } else {
-    await processPostData(props, from)
-  }
   return {
     props,
-    revalidate: process.env.EXPORT
+    revalidate: isExport()
       ? undefined
       : siteConfig(
-          'NEXT_REVALIDATE_SECOND',
-          BLOG.NEXT_REVALIDATE_SECOND,
-          props.NOTION_CONFIG
-        )
+        'NEXT_REVALIDATE_SECOND',
+        BLOG.NEXT_REVALIDATE_SECOND,
+        props.NOTION_CONFIG
+      ),
+    notFound: !props.post
   }
 }
 
